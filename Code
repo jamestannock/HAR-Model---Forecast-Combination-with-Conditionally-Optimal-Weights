@@ -1,0 +1,316 @@
+# --- Model
+
+import statsmodels.api as sm
+import pandas as pd
+import numpy as np
+
+# --- 0. User-Defined Parameters ---
+horizons = [1, 5, 10, 22]
+
+# --- Helper Function to Fit AR(1) Without Intercept ---
+def fit_ar1(residuals):
+    """
+    Fit an AR(1) model without intercept to the residuals.
+    Returns the AR(1) coefficient phi.
+    If the residuals are insufficient for fitting, returns 0.
+    """
+    if len(residuals) < 2:
+        return 0.0  # Default phi if not enough data
+    e_t = residuals[1:]
+    e_tm1 = residuals[:-1]
+    # Fit AR(1) without intercept
+    model = sm.OLS(e_t, e_tm1).fit()
+    phi = model.params[0]
+    return phi
+
+# --- 1. Data Preparation ---
+df = pd.read_csv("merged_RV_data.csv")
+
+df['Date'] = pd.to_datetime(df['Date'])
+df.set_index('Date', inplace=True)
+
+df['RV_daily_SP500'] = df['SP500_RV'].shift(1)
+df['RV_weekly_SP500'] = df['SP500_RV'].rolling(window=5).mean().shift(1)
+df['RV_monthly_SP500'] = df['SP500_RV'].rolling(window=22).mean().shift(1)
+
+df['RV_daily_DJ'] = df['DJ_RV'].shift(1)
+df['RV_weekly_DJ'] = df['DJ_RV'].rolling(window=5).mean().shift(1)
+df['RV_monthly_DJ'] = df['DJ_RV'].rolling(window=22).mean().shift(1)
+
+# Ensure no NaN values after rolling operations
+df.dropna(inplace=True)
+
+df_direct = df.reset_index()
+
+for h in horizons:
+    df_direct[f'Avg_RV_SP500_h{h}'] = df_direct['SP500_RV'].rolling(window=h).mean().shift(-h)
+    df_direct[f'Avg_RV_DJ_h{h}'] = df_direct['DJ_RV'].rolling(window=h).mean().shift(-h)
+
+df_direct.dropna(inplace=True)
+
+# --- 2. Define Evaluation Period ---
+df_direct['Date'] = pd.to_datetime(df_direct['Date'])
+start_date = pd.to_datetime(EVALUATION_START_DATE)
+end_date = pd.to_datetime(EVALUATION_END_DATE) if EVALUATION_END_DATE else df_direct['Date'].max()
+end_date = min(end_date, df_direct['Date'].max())
+
+df_evaluation = df_direct[(df_direct['Date'] >= start_date) & (df_direct['Date'] <= end_date)].reset_index(drop=True)
+
+# --- 3. Forecasting Loop with Conditionally Optimal Weights ---
+collect_sp500 = {h: [] for h in horizons}
+collect_dj = {h: [] for h in horizons}
+
+# Track weights over time for analysis
+weights_over_time_sp500_cowar = {h: [] for h in horizons}
+weights_over_time_dj_cowar = {h: [] for h in horizons}
+
+for h in horizons:
+    for idx, row in df_evaluation.iterrows():
+        current_date = row['Date']
+        i = df_direct.index[df_direct['Date'] == current_date].tolist()
+        if not i:
+            print(f"Date {current_date} not found. Skipping.")
+            continue
+        
+        i = i[0]
+        if i + h >= len(df_direct):
+            print(f"Not enough data for horizon {h} at {current_date}")
+            continue
+        
+        try:
+            # --- SP500 --- #
+            # HARd Model
+            X_train_hard_sp500 = df_direct.loc[:i-1, ['RV_daily_SP500']]
+            y_train_hard_sp500 = df_direct.loc[:i-1, f'Avg_RV_SP500_h{h}']
+            hard_model_sp500 = sm.OLS(y_train_hard_sp500, X_train_hard_sp500).fit()
+            X_test_hard_sp500 = df_direct.loc[[i], ['RV_daily_SP500']]
+            y_pred_hard_sp500 = hard_model_sp500.predict(X_test_hard_sp500).iloc[0]
+
+            # HARw Model
+            X_train_harw_sp500 = df_direct.loc[:i-1, ['RV_weekly_SP500']]
+            y_train_harw_sp500 = df_direct.loc[:i-1, f'Avg_RV_SP500_h{h}']
+            harw_model_sp500 = sm.OLS(y_train_harw_sp500, X_train_harw_sp500).fit()
+            X_test_harw_sp500 = df_direct.loc[[i], ['RV_weekly_SP500']]
+            y_pred_harw_sp500 = harw_model_sp500.predict(X_test_harw_sp500).iloc[0]
+
+            # HARm Model
+            X_train_harm_sp500 = df_direct.loc[:i-1, ['RV_monthly_SP500']]
+            y_train_harm_sp500 = df_direct.loc[:i-1, f'Avg_RV_SP500_h{h}']
+            harm_model_sp500 = sm.OLS(y_train_harm_sp500, X_train_harm_sp500).fit()
+            X_test_harm_sp500 = df_direct.loc[[i], ['RV_monthly_SP500']]
+            y_pred_harm_sp500 = harm_model_sp500.predict(X_test_harm_sp500).iloc[0]
+
+            # Extract residuals
+            residuals_hard_sp500 = hard_model_sp500.resid.values
+            residuals_harw_sp500 = harw_model_sp500.resid.values
+            residuals_harm_sp500 = harm_model_sp500.resid.values
+
+            # Fit AR(1) models to residuals to get phi coefficients
+            phi_hard_sp500 = fit_ar1(residuals_hard_sp500)
+            phi_harw_sp500 = fit_ar1(residuals_harw_sp500)
+            phi_harm_sp500 = fit_ar1(residuals_harm_sp500)
+
+            # Compute xi residuals: xi_t = e_t - phi * e_{t-1}
+            xi_hard_sp500 = residuals_hard_sp500[1:] - phi_hard_sp500 * residuals_hard_sp500[:-1]
+            xi_harw_sp500 = residuals_harw_sp500[1:] - phi_harw_sp500 * residuals_harw_sp500[:-1]
+            xi_harm_sp500 = residuals_harm_sp500[1:] - phi_harm_sp500 * residuals_harm_sp500[:-1]
+
+            # Align xi residuals by trimming the first observation
+            min_length_sp500 = min(len(xi_hard_sp500), len(xi_harw_sp500), len(xi_harm_sp500))
+            xi_matrix_sp500 = np.vstack([
+                xi_hard_sp500[-min_length_sp500:],
+                xi_harw_sp500[-min_length_sp500:],
+                xi_harm_sp500[-min_length_sp500:]
+            ]).T
+
+            # Compute Sigma_xi as covariance of xi residuals
+            Sigma_xi_sp500 = np.cov(xi_matrix_sp500, rowvar=False)
+
+            # Get the latest residuals (at time T)
+            e_T_hard_sp500 = residuals_hard_sp500[-1]
+            e_T_harw_sp500 = residuals_harw_sp500[-1]
+            e_T_harm_sp500 = residuals_harm_sp500[-1]
+
+            # Compute b_T = phi * e_T for each model
+            b_T_sp500 = np.array([
+                phi_hard_sp500 * e_T_hard_sp500,
+                phi_harw_sp500 * e_T_harw_sp500,
+                phi_harm_sp500 * e_T_harm_sp500
+            ])
+
+            # Adjust Sigma_xi by adding b_T b_T'
+            Sigma_adjusted_sp500 = Sigma_xi_sp500 + np.outer(b_T_sp500, b_T_sp500)
+
+            # Check if Sigma_adjusted_sp500 is invertible
+            try:
+                inv_Sigma_adjusted_sp500 = np.linalg.inv(Sigma_adjusted_sp500)
+            except np.linalg.LinAlgError:
+                print(f"Singular matrix for SP500 at {current_date} with horizon {h}. Skipping.")
+                continue
+
+            # Conditionally optimal weights for SP500
+            ones = np.ones(3)
+            w_opt_sp500 = inv_Sigma_adjusted_sp500.dot(ones) / (ones.T @ inv_Sigma_adjusted_sp500 @ ones)
+
+            # Store the weights for SP500
+            weights_over_time_sp500_cowar[h].append({
+                'Date': current_date,
+                'weights': w_opt_sp500
+            })
+
+            # Combined forecast
+            y_pred_sp500 = (w_opt_sp500[0] * y_pred_hard_sp500 +
+                            w_opt_sp500[1] * y_pred_harw_sp500 +
+                            w_opt_sp500[2] * y_pred_harm_sp500)
+
+            # True value and MSE
+            y_true_sp500_avg = df_direct.iloc[i+1:i + h + 1]['SP500_RV'].mean()
+            mse_sp500_value = (y_true_sp500_avg - y_pred_sp500) ** 2
+            collect_sp500[h].append({
+                'forecast': y_pred_sp500,
+                'mse': mse_sp500_value,
+                'Date': current_date,
+                'weights': w_opt_sp500
+            })
+
+            # --- DJ --- #
+            # HARd Model
+            X_train_hard_dj = df_direct.loc[:i-1, ['RV_daily_DJ']]
+            y_train_hard_dj = df_direct.loc[:i-1, f'Avg_RV_DJ_h{h}']
+            hard_model_dj = sm.OLS(y_train_hard_dj, X_train_hard_dj).fit()
+            X_test_hard_dj = df_direct.loc[[i], ['RV_daily_DJ']]
+            y_pred_hard_dj = hard_model_dj.predict(X_test_hard_dj).iloc[0]
+
+            # HARw Model
+            X_train_harw_dj = df_direct.loc[:i-1, ['RV_weekly_DJ']]
+            y_train_harw_dj = df_direct.loc[:i-1, f'Avg_RV_DJ_h{h}']
+            harw_model_dj = sm.OLS(y_train_harw_dj, X_train_harw_dj).fit()
+            X_test_harw_dj = df_direct.loc[[i], ['RV_weekly_DJ']]
+            y_pred_harw_dj = harw_model_dj.predict(X_test_harw_dj).iloc[0]
+
+            # HARm Model
+            X_train_harm_dj = df_direct.loc[:i-1, ['RV_monthly_DJ']]
+            y_train_harm_dj = df_direct.loc[:i-1, f'Avg_RV_DJ_h{h}']
+            harm_model_dj = sm.OLS(y_train_harm_dj, X_train_harm_dj).fit()
+            X_test_harm_dj = df_direct.loc[[i], ['RV_monthly_DJ']]
+            y_pred_harm_dj = harm_model_dj.predict(X_test_harm_dj).iloc[0]
+
+            # Extract residuals
+            residuals_hard_dj = hard_model_dj.resid.values
+            residuals_harw_dj = harw_model_dj.resid.values
+            residuals_harm_dj = harm_model_dj.resid.values
+
+            # Fit AR(1) models to residuals to get phi coefficients
+            phi_hard_dj = fit_ar1(residuals_hard_dj)
+            phi_harw_dj = fit_ar1(residuals_harw_dj)
+            phi_harm_dj = fit_ar1(residuals_harm_dj)
+
+            # Compute xi residuals: xi_t = e_t - phi * e_{t-1}
+            xi_hard_dj = residuals_hard_dj[1:] - phi_hard_dj * residuals_hard_dj[:-1]
+            xi_harw_dj = residuals_harw_dj[1:] - phi_harw_dj * residuals_harw_dj[:-1]
+            xi_harm_dj = residuals_harm_dj[1:] - phi_harm_dj * residuals_harm_dj[:-1]
+
+            # Align xi residuals by trimming the first observation
+            min_length_dj = min(len(xi_hard_dj), len(xi_harw_dj), len(xi_harm_dj))
+            xi_matrix_dj = np.vstack([
+                xi_hard_dj[-min_length_dj:],
+                xi_harw_dj[-min_length_dj:],
+                xi_harm_dj[-min_length_dj:]
+            ]).T
+
+            # Compute Sigma_xi as covariance of xi residuals
+            Sigma_xi_dj = np.cov(xi_matrix_dj, rowvar=False)
+
+            # Get the latest residuals (at time T)
+            e_T_hard_dj = residuals_hard_dj[-1]
+            e_T_harw_dj = residuals_harw_dj[-1]
+            e_T_harm_dj = residuals_harm_dj[-1]
+
+            # Compute b_T = phi * e_T for each model
+            b_T_dj = np.array([
+                phi_hard_dj * e_T_hard_dj,
+                phi_harw_dj * e_T_harw_dj,
+                phi_harm_dj * e_T_harm_dj
+            ])
+
+            # Adjust Sigma_xi by adding b_T b_T'
+            Sigma_adjusted_dj = Sigma_xi_dj + np.outer(b_T_dj, b_T_dj)
+
+            # Check if Sigma_adjusted_dj is invertible
+            try:
+                inv_Sigma_adjusted_dj = np.linalg.inv(Sigma_adjusted_dj)
+            except np.linalg.LinAlgError:
+                print(f"Singular matrix for DJ at {current_date} with horizon {h}. Skipping.")
+                continue
+
+            # Conditionally optimal weights for DJ
+            w_opt_dj = inv_Sigma_adjusted_dj.dot(ones) / (ones.T @ inv_Sigma_adjusted_dj @ ones)
+
+            # Store the weights for DJ
+            weights_over_time_dj_cowar[h].append({
+                'Date': current_date,
+                'weights': w_opt_dj
+            })
+
+            # Combined forecast
+            y_pred_dj = (w_opt_dj[0] * y_pred_hard_dj +
+                         w_opt_dj[1] * y_pred_harw_dj +
+                         w_opt_dj[2] * y_pred_harm_dj)
+
+            # True value and MSE
+            y_true_dj_avg = df_direct.iloc[i+1:i + h + 1]['DJ_RV'].mean()
+            mse_dj_value = (y_true_dj_avg - y_pred_dj) ** 2
+            collect_dj[h].append({
+                'forecast': y_pred_dj,
+                'mse': mse_dj_value,
+                'Date': current_date,
+                'weights': w_opt_dj
+            })
+
+        except Exception as e:
+            print(f"Failed to predict for {current_date} and horizon {h}: {e}")
+            continue
+
+# --- 4. Convert Collected Data to DataFrames ---
+results_sp500_cowar = {}
+results_dj_cowar = {}
+
+for h in horizons:
+    if collect_sp500[h]:
+        df_sp500 = pd.DataFrame(collect_sp500[h])
+        try:
+            df_sp500.set_index('Date', inplace=True)
+        except KeyError:
+            print(f"Missing 'Date' in SP500 results for horizon {h}.")
+            continue
+        results_sp500_cowar[h] = df_sp500
+    else:
+        results_sp500_cowar[h] = pd.DataFrame(columns=['forecast', 'mse', 'Date', 'weights'])
+
+    if collect_dj[h]:
+        df_dj = pd.DataFrame(collect_dj[h])
+        try:
+            df_dj.set_index('Date', inplace=True)
+        except KeyError:
+            print(f"Missing 'Date' in DJ results for horizon {h}.")
+            continue
+        results_dj_cowar[h] = df_dj
+    else:
+        results_dj_cowar[h] = pd.DataFrame(columns=['forecast', 'mse', 'Date', 'weights'])
+
+# --- 5. Print Average MSEs ---
+print("\nAverage Mean Squared Errors (MSE) for SP500:")
+for h in horizons:
+    if not results_sp500_cowar[h].empty:
+        avg_mse_sp500 = results_sp500_cowar[h]['mse'].mean()
+        print(f'{h}-step ahead forecast MSE: {avg_mse_sp500:.12f}')
+    else:
+        print(f'{h}-step ahead forecast MSE: No data available.')
+
+print("\nAverage Mean Squared Errors (MSE) for DJ:")
+for h in horizons:
+    if not results_dj_cowar[h].empty:
+        avg_mse_dj = results_dj_cowar[h]['mse'].mean()
+        print(f'{h}-step ahead forecast MSE: {avg_mse_dj:.12f}')
+    else:
+        print(f'{h}-step ahead forecast MSE: No data available.')
