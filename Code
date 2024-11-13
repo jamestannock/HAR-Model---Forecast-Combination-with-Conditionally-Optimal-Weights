@@ -5,6 +5,9 @@ import pandas as pd
 import numpy as np
 
 # --- 0. User-Defined Parameters ---
+EVALUATION_START_DATE = '2010-03-16'  # Start of evaluation period
+EVALUATION_END_DATE = '2025-01-01'    # Optional: End of evaluation period
+
 horizons = [1, 5, 10, 22]
 
 # --- Helper Function to Fit AR(1) Without Intercept ---
