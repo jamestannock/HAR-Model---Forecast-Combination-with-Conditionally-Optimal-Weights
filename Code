@@ -10,7 +10,7 @@ EVALUATION_END_DATE = '2025-01-01'    # Optional: End of evaluation period
 
 horizons = [1, 5, 10, 22]
 
-# --- Helper Function to Fit AR(1) Without Intercept ---
+# --- Helper Function to Fit AR(1) Without Intercept to Individual Forecast Error Model ---
 def fit_ar1(residuals):
     """
     Fit an AR(1) model without intercept to the residuals.
